@@ -48,6 +48,7 @@
 /* USER CODE BEGIN Includes */
 
 #include <string.h>
+#include <stdbool.h>
 
 /* USER CODE END Includes */
 
@@ -111,13 +112,16 @@ typedef struct
 	uint8_t volume;
 } tone_t;
 
-#define PWM_DMA_BUFFER_SIZE 1000
+#define PWM_DMA_BUFFER_SIZE 1024
 __IO uint16_t pwm_dma_buffer[PWM_DMA_BUFFER_SIZE];
 
 #define PWM_FREQ 31250
+#define PWM_PERIOD	1024
 
 FATFS fatfs;
 FIL MyFile;
+
+volatile bool pwm_dma_ready, pwm_dma_lower_half, end_of_file;
 
 /* USER CODE END PV */
 
@@ -139,11 +143,25 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
+	if(end_of_file)
+	{
+		HAL_TIM_PWM_Stop_DMA(&htim1, TIM_CHANNEL_1);
+		HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
+	}
+	pwm_dma_ready = true;
+	pwm_dma_lower_half = false;
 	HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
 }
 
 void HAL_TIM_PWM_PulseHalfFinishedCallback(DMA_HandleTypeDef *hdma)
 {
+	if(end_of_file)
+	{
+		HAL_TIM_PWM_Stop_DMA(&htim1, TIM_CHANNEL_1);
+		HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
+	}
+	pwm_dma_ready = true;
+	pwm_dma_lower_half = true;
 	HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
 }
 
@@ -519,6 +537,10 @@ void read_file(void)
 	}
 }
 
+#define BUFFER_SIZE 512
+uint8_t buffer[BUFFER_SIZE];
+uint8_t header[44];
+
 void playback(void)
 {
 	if(f_open(&MyFile, "test.wav", FA_OPEN_EXISTING | FA_READ) != FR_OK)
@@ -530,52 +552,121 @@ void playback(void)
 		printf("File opened\n");
 		
 		uint32_t bytesread;
-		uint8_t buffer[44];
+		FRESULT res;
 		
-		HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+		//read header (44 bytes)
+		res = f_read(&MyFile, header, 44, (UINT*)&bytesread);
 		
-		FRESULT res = f_read(&MyFile, buffer, sizeof(buffer), (UINT*)&bytesread);
-		
-		HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-		
-		if((bytesread < sizeof(buffer)) || (res != FR_OK))
+		if((bytesread < 44) || (res != FR_OK))
 		{
 			printf("Failed to read file\n");
 		}
 		else
 		{
-			/*
-			for(uint8_t i = 0; i < sizeof(buffer); i++)
-			{
-				printf("%x\t", buffer[i]);
-				if((i % 16) == 15)
-				{
-					printf("\n");
-				}
-			}
-			printf("\n");
-			*/
-			
-			uint16_t channels = buffer[22] + (buffer[23]<<8);
-			uint32_t sample_rate = buffer[24] + (buffer[25]<<8) + (buffer[26]<<16) + (buffer[27]<<24);
-			uint16_t bits_per_sample = buffer[34] + (buffer[35]<<8);
+			uint16_t channels = header[22] + (header[23]<<8);
+			uint32_t sample_rate = header[24] + (header[25]<<8) + (header[26]<<16) + (header[27]<<24);
+			uint16_t bits_per_sample = header[34] + (header[35]<<8);
 			
 			printf("channels: %d\n", channels);
 			printf("sample rate: %d\n", sample_rate);
 			printf("bits per sample: %d\n", bits_per_sample);
 			
-			/*
-			if(f_close(&MyFile) != FR_OK)
+			uint32_t count = 0;
+			int32_t pcm_value;
+			
+			//fill up pwm buffer before we start
+			
+			//lower half
+			res = f_read(&MyFile, buffer, BUFFER_SIZE, (UINT*)&bytesread);
+			if(res != FR_OK)
 			{
-				printf("failed to close file\n");
+				printf("Read failed, count: %d\n", count);
+				end_of_file = true;
 			}
-			else
+			
+			if(bytesread != BUFFER_SIZE)
 			{
-				printf("file closed\n");
+				printf("read less bytes than buffersize: %d\n", bytesread);
 			}
-			*/
+			
+			count++;
+			for(uint16_t i = 0; i < bytesread; i+=2)
+			{
+				pcm_value = (int32_t)(buffer[i] + (buffer[i+1]<<8));
+				pwm_dma_buffer[i/2] = ((uint16_t)(pcm_value + 32768))>>5;
+			}
+			
+			//upper half
+			res = f_read(&MyFile, buffer, BUFFER_SIZE, (UINT*)&bytesread);
+			if(res != FR_OK)
+			{
+				printf("Read failed, count: %d\n", count);
+				end_of_file = true;
+			}
+			
+			if(bytesread != BUFFER_SIZE)
+			{
+				printf("read less bytes than buffersize: %d\n", bytesread);
+			}
+			
+			count++;
+			for(uint16_t i = 0; i < bytesread; i+=2)
+			{
+				pcm_value = (int32_t)(buffer[i] + (buffer[i+1]<<8));
+				pwm_dma_buffer[i/2 + BUFFER_SIZE/2] = ((uint16_t)(pcm_value + 32768))>>5;
+			}
+			
+			//start PWM
+			HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1, (uint32_t *)pwm_dma_buffer, BUFFER_SIZE);
+
+			HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+			
+			pwm_dma_ready = false;
+			
+			//loop until the end of file
+			while(end_of_file == false)
+			{
+				if(pwm_dma_ready)
+				{
+					res = f_read(&MyFile, buffer, BUFFER_SIZE, (UINT*)&bytesread);
+					if(res != FR_OK)
+					{
+						printf("Read failed, count: %d\n", count);
+						break;
+					}
+					
+					if(bytesread != BUFFER_SIZE)
+					{
+						printf("read less bytes than buffersize: %d\n", bytesread);
+					}
+					
+					if(f_eof(&MyFile))
+					{
+						printf("end of file\n");
+						end_of_file = true;
+					}
+					
+					for(uint16_t i = 0; i < bytesread; i+=2)
+					{
+						if(pwm_dma_lower_half)
+						{
+							pcm_value = (int32_t)(buffer[i] + (buffer[i+1]<<8));
+							pwm_dma_buffer[i/2] = ((uint16_t)(pcm_value + 32768))>>5;
+						}
+						else
+						{
+							pcm_value = (int32_t)(buffer[i] + (buffer[i+1]<<8));
+							pwm_dma_buffer[i/2 + BUFFER_SIZE/2] = ((uint16_t)(pcm_value + 32768))>>5;
+						}
+					}
+					
+					pwm_dma_ready = false;
+					count++;
+				}
+			}
 		}
 	}
+	printf("playback done\n");
 }
 
 /* USER CODE END PFP */
@@ -643,8 +734,8 @@ int main(void)
 	//play_tone((tone_t){1000, 1000, 64});
 	
 	/*
-	pwm_dma_buffer[0] = 128+64;
-	pwm_dma_buffer[1] = 128-64;
+	pwm_dma_buffer[0] = PWM_PERIOD + PWM_PERIOD/2;
+	pwm_dma_buffer[1] = PWM_PERIOD - PWM_PERIOD/2;
 
 	
 	HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1, (uint32_t *)pwm_dma_buffer, 2);
@@ -755,9 +846,9 @@ static void MX_TIM1_Init(void)
   TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig;
 
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 8;
+  htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 255;
+  htim1.Init.Period = 2047;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
