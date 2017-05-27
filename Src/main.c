@@ -47,13 +47,18 @@
 
 /* USER CODE BEGIN Includes */
 
+#include <string.h>
+
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
 SPI_HandleTypeDef hspi2;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
 DMA_HandleTypeDef hdma_tim1_ch1;
+
+UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
@@ -111,6 +116,9 @@ __IO uint16_t pwm_dma_buffer[PWM_DMA_BUFFER_SIZE];
 
 #define PWM_FREQ 31250
 
+FATFS fatfs;
+FIL MyFile;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -120,12 +128,24 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_SPI2_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_USART2_UART_Init(void);
                                     
 void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
                                 
 
 /* USER CODE BEGIN PFP */
 /* Private function prototypes -----------------------------------------------*/
+
+void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
+{
+	HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+}
+
+void HAL_TIM_PWM_PulseHalfFinishedCallback(DMA_HandleTypeDef *hdma)
+{
+	HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+}
 
 void play_tone(tone_t tone)
 {
@@ -144,6 +164,418 @@ void play_tone(tone_t tone)
 	
 	HAL_TIM_PWM_Stop_DMA(&htim1, TIM_CHANNEL_1);
 	HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+	if(htim->Instance == TIM2)
+	{
+		disk_timerproc();
+	}
+}
+
+#ifdef __GNUC__
+  /* With GCC/RAISONANCE, small printf (option LD Linker->Libraries->Small printf
+     set to 'Yes') calls __io_putchar() */
+  #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+#else
+  #define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
+#endif /* __GNUC__ */
+ 
+/**
+  * @brief  Retargets the C library printf function to the USART.
+  * @param  None
+  * @retval None
+  */
+PUTCHAR_PROTOTYPE
+{
+	/* Place your implementation of fputc here */
+	/* e.g. write a character to the USART */
+	HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 100);
+	
+	
+	return ch;
+}
+
+static
+DWORD pn (		/* Pseudo random number generator */
+    DWORD pns	/* 0:Initialize, !0:Read */
+)
+{
+    static DWORD lfsr;
+    UINT n;
+
+
+    if (pns) {
+        lfsr = pns;
+        for (n = 0; n < 32; n++) pn(0);
+    }
+    if (lfsr & 1) {
+        lfsr >>= 1;
+        lfsr ^= 0x80200003;
+    } else {
+        lfsr >>= 1;
+    }
+    return lfsr;
+}
+
+
+int test_diskio (
+    BYTE pdrv,      /* Physical drive number to be checked (all data on the drive will be lost) */
+    UINT ncyc,      /* Number of test cycles */
+    DWORD* buff,    /* Pointer to the working buffer */
+    UINT sz_buff    /* Size of the working buffer in unit of byte */
+)
+{
+    UINT n, cc, ns;
+    DWORD sz_drv, lba, lba2, sz_eblk, pns = 1;
+    WORD sz_sect;
+    BYTE *pbuff = (BYTE*)buff;
+    DSTATUS ds;
+    DRESULT dr;
+
+
+    printf("test_diskio(%u, %u, 0x%08X, 0x%08X)\n", pdrv, ncyc, (UINT)buff, sz_buff);
+
+    if (sz_buff < _MAX_SS + 4) {
+        printf("Insufficient work area to run program.\n");
+        return 1;
+    }
+
+    for (cc = 1; cc <= ncyc; cc++) {
+        printf("**** Test cycle %u of %u start ****\n", cc, ncyc);
+
+        /* Initialization */
+        printf(" disk_initalize(%u)", pdrv);
+        ds = disk_initialize(pdrv);
+        if (ds & STA_NOINIT) {
+            printf(" - failed.\n");
+            return 2;
+        } else {
+            printf(" - ok.\n");
+        }
+
+        /* Get drive size */
+        printf("**** Get drive size ****\n");
+        printf(" disk_ioctl(%u, GET_SECTOR_COUNT, 0x%08X)", pdrv, (UINT)&sz_drv);
+        sz_drv = 0;
+        dr = disk_ioctl(pdrv, GET_SECTOR_COUNT, &sz_drv);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 3;
+        }
+        if (sz_drv < 128) {
+            printf("Failed: Insufficient drive size to test.\n");
+            return 4;
+        }
+        printf(" Number of sectors on the drive %u is %lu.\n", pdrv, sz_drv);
+
+#if _MAX_SS != _MIN_SS
+        /* Get sector size */
+        printf("**** Get sector size ****\n");
+        printf(" disk_ioctl(%u, GET_SECTOR_SIZE, 0x%X)", pdrv, (UINT)&sz_sect);
+        sz_sect = 0;
+        dr = disk_ioctl(pdrv, GET_SECTOR_SIZE, &sz_sect);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 5;
+        }
+        printf(" Size of sector is %u bytes.\n", sz_sect);
+#else
+        sz_sect = _MAX_SS;
+#endif
+
+        /* Get erase block size */
+        printf("**** Get block size ****\n");
+        printf(" disk_ioctl(%u, GET_BLOCK_SIZE, 0x%X)", pdrv, (UINT)&sz_eblk);
+        sz_eblk = 0;
+        dr = disk_ioctl(pdrv, GET_BLOCK_SIZE, &sz_eblk);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+        }
+        if (dr == RES_OK || sz_eblk >= 2) {
+            printf(" Size of the erase block is %lu sectors.\n", sz_eblk);
+        } else {
+            printf(" Size of the erase block is unknown.\n");
+        }
+
+        /* Single sector write test */
+        printf("**** Single sector write test 1 ****\n");
+        lba = 0;
+        for (n = 0, pn(pns); n < sz_sect; n++) pbuff[n] = (BYTE)pn(0);
+        printf(" disk_write(%u, 0x%X, %lu, 1)", pdrv, (UINT)pbuff, lba);
+        dr = disk_write(pdrv, pbuff, lba, 1);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 6;
+        }
+        printf(" disk_ioctl(%u, CTRL_SYNC, NULL)", pdrv);
+        dr = disk_ioctl(pdrv, CTRL_SYNC, 0);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 7;
+        }
+        memset(pbuff, 0, sz_sect);
+        printf(" disk_read(%u, 0x%X, %lu, 1)", pdrv, (UINT)pbuff, lba);
+        dr = disk_read(pdrv, pbuff, lba, 1);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 8;
+        }
+        for (n = 0, pn(pns); n < sz_sect && pbuff[n] == (BYTE)pn(0); n++) ;
+        if (n == sz_sect) {
+            printf(" Data matched.\n");
+        } else {
+            printf("Failed: Read data differs from the data written.\n");
+            return 10;
+        }
+        pns++;
+
+        /* Multiple sector write test */
+        printf("**** Multiple sector write test ****\n");
+        lba = 1; ns = sz_buff / sz_sect;
+        if (ns > 4) ns = 4;
+        for (n = 0, pn(pns); n < (UINT)(sz_sect * ns); n++) pbuff[n] = (BYTE)pn(0);
+        printf(" disk_write(%u, 0x%X, %lu, %u)", pdrv, (UINT)pbuff, lba, ns);
+        dr = disk_write(pdrv, pbuff, lba, ns);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 11;
+        }
+        printf(" disk_ioctl(%u, CTRL_SYNC, NULL)", pdrv);
+        dr = disk_ioctl(pdrv, CTRL_SYNC, 0);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 12;
+        }
+        memset(pbuff, 0, sz_sect * ns);
+        printf(" disk_read(%u, 0x%X, %lu, %u)", pdrv, (UINT)pbuff, lba, ns);
+        dr = disk_read(pdrv, pbuff, lba, ns);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 13;
+        }
+        for (n = 0, pn(pns); n < (UINT)(sz_sect * ns) && pbuff[n] == (BYTE)pn(0); n++) ;
+        if (n == (UINT)(sz_sect * ns)) {
+            printf(" Data matched.\n");
+        } else {
+            printf("Failed: Read data differs from the data written.\n");
+            return 14;
+        }
+        pns++;
+
+        /* Single sector write test (misaligned memory address) */
+        printf("**** Single sector write test (misaligned address) ****\n");
+        lba = 5;
+        for (n = 0, pn(pns); n < sz_sect; n++) pbuff[n+3] = (BYTE)pn(0);
+        printf(" disk_write(%u, 0x%X, %lu, 1)", pdrv, (UINT)(pbuff+3), lba);
+        dr = disk_write(pdrv, pbuff+3, lba, 1);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 15;
+        }
+        printf(" disk_ioctl(%u, CTRL_SYNC, NULL)", pdrv);
+        dr = disk_ioctl(pdrv, CTRL_SYNC, 0);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 16;
+        }
+        memset(pbuff+5, 0, sz_sect);
+        printf(" disk_read(%u, 0x%X, %lu, 1)", pdrv, (UINT)(pbuff+5), lba);
+        dr = disk_read(pdrv, pbuff+5, lba, 1);
+        if (dr == RES_OK) {
+            printf(" - ok.\n");
+        } else {
+            printf(" - failed.\n");
+            return 17;
+        }
+        for (n = 0, pn(pns); n < sz_sect && pbuff[n+5] == (BYTE)pn(0); n++) ;
+        if (n == sz_sect) {
+            printf(" Data matched.\n");
+        } else {
+            printf("Failed: Read data differs from the data written.\n");
+            return 18;
+        }
+        pns++;
+
+        /* 4GB barrier test */
+        printf("**** 4GB barrier test ****\n");
+        if (sz_drv >= 128 + 0x80000000 / (sz_sect / 2)) {
+            lba = 6; lba2 = lba + 0x80000000 / (sz_sect / 2);
+            for (n = 0, pn(pns); n < (UINT)(sz_sect * 2); n++) pbuff[n] = (BYTE)pn(0);
+            printf(" disk_write(%u, 0x%X, %lu, 1)", pdrv, (UINT)pbuff, lba);
+            dr = disk_write(pdrv, pbuff, lba, 1);
+            if (dr == RES_OK) {
+                printf(" - ok.\n");
+            } else {
+                printf(" - failed.\n");
+                return 19;
+            }
+            printf(" disk_write(%u, 0x%X, %lu, 1)", pdrv, (UINT)(pbuff+sz_sect), lba2);
+            dr = disk_write(pdrv, pbuff+sz_sect, lba2, 1);
+            if (dr == RES_OK) {
+                printf(" - ok.\n");
+            } else {
+                printf(" - failed.\n");
+                return 20;
+            }
+            printf(" disk_ioctl(%u, CTRL_SYNC, NULL)", pdrv);
+            dr = disk_ioctl(pdrv, CTRL_SYNC, 0);
+            if (dr == RES_OK) {
+            printf(" - ok.\n");
+            } else {
+                printf(" - failed.\n");
+                return 21;
+            }
+            memset(pbuff, 0, sz_sect * 2);
+            printf(" disk_read(%u, 0x%X, %lu, 1)", pdrv, (UINT)pbuff, lba);
+            dr = disk_read(pdrv, pbuff, lba, 1);
+            if (dr == RES_OK) {
+                printf(" - ok.\n");
+            } else {
+                printf(" - failed.\n");
+                return 22;
+            }
+            printf(" disk_read(%u, 0x%X, %lu, 1)", pdrv, (UINT)(pbuff+sz_sect), lba2);
+            dr = disk_read(pdrv, pbuff+sz_sect, lba2, 1);
+            if (dr == RES_OK) {
+                printf(" - ok.\n");
+            } else {
+                printf(" - failed.\n");
+                return 23;
+            }
+            for (n = 0, pn(pns); pbuff[n] == (BYTE)pn(0) && n < (UINT)(sz_sect * 2); n++) ;
+            if (n == (UINT)(sz_sect * 2)) {
+                printf(" Data matched.\n");
+            } else {
+                printf("Failed: Read data differs from the data written.\n");
+                return 24;
+            }
+        } else {
+            printf(" Test skipped.\n");
+        }
+        pns++;
+
+        printf("**** Test cycle %u of %u completed ****\n\n", cc, ncyc);
+    }
+
+    return 0;
+}
+
+//DWORD buff[1024];  /* 4096 byte working buffer */
+
+void read_file(void)
+{
+	if(f_open(&MyFile, "test.txt", FA_OPEN_EXISTING | FA_READ) != FR_OK)
+	{
+		printf("failed to open file\n");
+	}
+	else
+	{
+		printf("File opened\n");
+		
+		uint32_t bytesread;
+		uint8_t rtext[100];
+		
+		FRESULT res = f_read(&MyFile, rtext, sizeof(rtext), (UINT*)&bytesread);
+		if((bytesread == 0) || (res != FR_OK))
+		{
+			printf("Failed to read file\n");
+		}
+		else
+		{
+			printf("Read: %s\n", rtext);
+			if(f_close(&MyFile) != FR_OK)
+			{
+				printf("failed to close file\n");
+			}
+			else
+			{
+				printf("file closed\n");
+			}
+		}
+	}
+}
+
+void playback(void)
+{
+	if(f_open(&MyFile, "test.wav", FA_OPEN_EXISTING | FA_READ) != FR_OK)
+	{
+		printf("failed to open file\n");
+	}
+	else
+	{
+		printf("File opened\n");
+		
+		uint32_t bytesread;
+		uint8_t buffer[44];
+		
+		HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+		
+		FRESULT res = f_read(&MyFile, buffer, sizeof(buffer), (UINT*)&bytesread);
+		
+		HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+		
+		if((bytesread < sizeof(buffer)) || (res != FR_OK))
+		{
+			printf("Failed to read file\n");
+		}
+		else
+		{
+			/*
+			for(uint8_t i = 0; i < sizeof(buffer); i++)
+			{
+				printf("%x\t", buffer[i]);
+				if((i % 16) == 15)
+				{
+					printf("\n");
+				}
+			}
+			printf("\n");
+			*/
+			
+			uint16_t channels = buffer[22] + (buffer[23]<<8);
+			uint32_t sample_rate = buffer[24] + (buffer[25]<<8) + (buffer[26]<<16) + (buffer[27]<<24);
+			uint16_t bits_per_sample = buffer[34] + (buffer[35]<<8);
+			
+			printf("channels: %d\n", channels);
+			printf("sample rate: %d\n", sample_rate);
+			printf("bits per sample: %d\n", bits_per_sample);
+			
+			/*
+			if(f_close(&MyFile) != FR_OK)
+			{
+				printf("failed to close file\n");
+			}
+			else
+			{
+				printf("file closed\n");
+			}
+			*/
+		}
+	}
 }
 
 /* USER CODE END PFP */
@@ -173,11 +605,42 @@ int main(void)
   MX_TIM1_Init();
   MX_FATFS_Init();
   MX_SPI2_Init();
+  MX_TIM2_Init();
+  MX_USART2_UART_Init();
 
   /* USER CODE BEGIN 2 */
 	
-	play_tone((tone_t){880, 1000, 128});
-	play_tone((tone_t){1000, 1000, 128});
+	printf("Up and running\r\n");
+	
+	htim1.hdma[TIM_DMA_ID_CC1]->XferHalfCpltCallback = HAL_TIM_PWM_PulseHalfFinishedCallback;
+	HAL_TIM_Base_Start_IT(&htim2);
+
+	if (f_mount(&fatfs, USER_Path, 0) != FR_OK)
+	{
+		printf("error in mounting disk\n");
+	}
+	else
+	{
+		printf("disk mounted\n");
+		//read_file();
+		playback();
+	}
+
+	
+	/*
+	int rc;
+
+	// Check function/compatibility of the physical drive #0
+	rc = test_diskio(0, 3, buff, sizeof buff);
+	if (rc) {
+			printf("Sorry the function/compatibility test failed. (rc=%d)\nFatFs will not work on this disk driver.\n", rc);
+	} else {
+			printf("Congratulations! The disk driver works well.\n");
+	}
+	*/
+	
+	//play_tone((tone_t){880, 1000, 64});
+	//play_tone((tone_t){1000, 1000, 64});
 	
 	/*
 	pwm_dma_buffer[0] = 128+64;
@@ -269,7 +732,7 @@ static void MX_SPI2_Init(void)
   hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi2.Init.NSS = SPI_NSS_HARD_OUTPUT;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
   hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
@@ -348,6 +811,57 @@ static void MX_TIM1_Init(void)
 
 }
 
+/* TIM2 init function */
+static void MX_TIM2_Init(void)
+{
+
+  TIM_ClockConfigTypeDef sClockSourceConfig;
+  TIM_MasterConfigTypeDef sMasterConfig;
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 64000;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 10;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+}
+
+/* USART2 init function */
+static void MX_USART2_UART_Init(void)
+{
+
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+}
+
 /** 
   * Enable DMA controller clock
   */
@@ -369,8 +883,6 @@ static void MX_DMA_Init(void)
         * Output
         * EVENT_OUT
         * EXTI
-     PA2   ------> USART2_TX
-     PA3   ------> USART2_RX
 */
 static void MX_GPIO_Init(void)
 {
@@ -386,23 +898,26 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : USART_TX_Pin USART_RX_Pin */
-  GPIO_InitStruct.Pin = USART_TX_Pin|USART_RX_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
   /*Configure GPIO pin : LD2_Pin */
   GPIO_InitStruct.Pin = LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB12 */
+  GPIO_InitStruct.Pin = GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);

@@ -52,19 +52,13 @@
 
 /* USER CODE BEGIN 0 */
 
+void disk_timerproc(void);
+	 
 /* Includes ------------------------------------------------------------------*/
 /* Exported types ------------------------------------------------------------*/
 /* Exported constants --------------------------------------------------------*/
 /* Exported functions ------------------------------------------------------- */
 extern Diskio_drvTypeDef  USER_Driver;
-	 
-/*-----------------------------------------------------------------------*/
-/* Device Timer Interrupt Procedure  (Platform dependent)                */
-/*-----------------------------------------------------------------------*/
-/* This function must be called in period of 10ms                        */
-
-void disk_timerproc(void);
-
 
 /* USER CODE END 0 */
    
