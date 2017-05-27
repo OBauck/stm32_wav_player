@@ -1,3 +1,5 @@
 Drivers/
 Middlewares/
 stm32_sound/
+*.TMP
+*.Ole
