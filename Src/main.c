@@ -121,6 +121,10 @@ __IO uint16_t pwm_dma_buffer[PWM_DMA_BUFFER_SIZE];
 FATFS fatfs;
 FIL MyFile;
 
+#define FATFS_BUFFER_SIZE 512
+uint8_t fatfs_buffer[FATFS_BUFFER_SIZE];
+uint8_t header[44];
+
 volatile bool pwm_dma_ready, pwm_dma_lower_half, end_of_file;
 
 /* USER CODE END PV */
@@ -215,455 +219,109 @@ PUTCHAR_PROTOTYPE
 	return ch;
 }
 
-static
-DWORD pn (		/* Pseudo random number generator */
-    DWORD pns	/* 0:Initialize, !0:Read */
-)
+void pwm_dma_fill_buffer(uint8_t *wav_data, uint16_t data_size, bool lower_half)
 {
-    static DWORD lfsr;
-    UINT n;
-
-
-    if (pns) {
-        lfsr = pns;
-        for (n = 0; n < 32; n++) pn(0);
-    }
-    if (lfsr & 1) {
-        lfsr >>= 1;
-        lfsr ^= 0x80200003;
-    } else {
-        lfsr >>= 1;
-    }
-    return lfsr;
+	int32_t pcm_value;
+	uint16_t buffer_start = lower_half ? 0 : FATFS_BUFFER_SIZE/2;
+	
+	for(uint16_t i = 0; i < data_size; i+=2)
+	{
+		pcm_value = (int32_t)(wav_data[i] + (wav_data[i+1]<<8));
+		pwm_dma_buffer[i/2 + buffer_start] = ((uint16_t)(pcm_value + 32768))>>5;
+	}
 }
 
-
-int test_diskio (
-    BYTE pdrv,      /* Physical drive number to be checked (all data on the drive will be lost) */
-    UINT ncyc,      /* Number of test cycles */
-    DWORD* buff,    /* Pointer to the working buffer */
-    UINT sz_buff    /* Size of the working buffer in unit of byte */
-)
+void playback(const char* path)
 {
-    UINT n, cc, ns;
-    DWORD sz_drv, lba, lba2, sz_eblk, pns = 1;
-    WORD sz_sect;
-    BYTE *pbuff = (BYTE*)buff;
-    DSTATUS ds;
-    DRESULT dr;
-
-
-    printf("test_diskio(%u, %u, 0x%08X, 0x%08X)\n", pdrv, ncyc, (UINT)buff, sz_buff);
-
-    if (sz_buff < _MAX_SS + 4) {
-        printf("Insufficient work area to run program.\n");
-        return 1;
-    }
-
-    for (cc = 1; cc <= ncyc; cc++) {
-        printf("**** Test cycle %u of %u start ****\n", cc, ncyc);
-
-        /* Initialization */
-        printf(" disk_initalize(%u)", pdrv);
-        ds = disk_initialize(pdrv);
-        if (ds & STA_NOINIT) {
-            printf(" - failed.\n");
-            return 2;
-        } else {
-            printf(" - ok.\n");
-        }
-
-        /* Get drive size */
-        printf("**** Get drive size ****\n");
-        printf(" disk_ioctl(%u, GET_SECTOR_COUNT, 0x%08X)", pdrv, (UINT)&sz_drv);
-        sz_drv = 0;
-        dr = disk_ioctl(pdrv, GET_SECTOR_COUNT, &sz_drv);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 3;
-        }
-        if (sz_drv < 128) {
-            printf("Failed: Insufficient drive size to test.\n");
-            return 4;
-        }
-        printf(" Number of sectors on the drive %u is %lu.\n", pdrv, sz_drv);
-
-#if _MAX_SS != _MIN_SS
-        /* Get sector size */
-        printf("**** Get sector size ****\n");
-        printf(" disk_ioctl(%u, GET_SECTOR_SIZE, 0x%X)", pdrv, (UINT)&sz_sect);
-        sz_sect = 0;
-        dr = disk_ioctl(pdrv, GET_SECTOR_SIZE, &sz_sect);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 5;
-        }
-        printf(" Size of sector is %u bytes.\n", sz_sect);
-#else
-        sz_sect = _MAX_SS;
-#endif
-
-        /* Get erase block size */
-        printf("**** Get block size ****\n");
-        printf(" disk_ioctl(%u, GET_BLOCK_SIZE, 0x%X)", pdrv, (UINT)&sz_eblk);
-        sz_eblk = 0;
-        dr = disk_ioctl(pdrv, GET_BLOCK_SIZE, &sz_eblk);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-        }
-        if (dr == RES_OK || sz_eblk >= 2) {
-            printf(" Size of the erase block is %lu sectors.\n", sz_eblk);
-        } else {
-            printf(" Size of the erase block is unknown.\n");
-        }
-
-        /* Single sector write test */
-        printf("**** Single sector write test 1 ****\n");
-        lba = 0;
-        for (n = 0, pn(pns); n < sz_sect; n++) pbuff[n] = (BYTE)pn(0);
-        printf(" disk_write(%u, 0x%X, %lu, 1)", pdrv, (UINT)pbuff, lba);
-        dr = disk_write(pdrv, pbuff, lba, 1);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 6;
-        }
-        printf(" disk_ioctl(%u, CTRL_SYNC, NULL)", pdrv);
-        dr = disk_ioctl(pdrv, CTRL_SYNC, 0);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 7;
-        }
-        memset(pbuff, 0, sz_sect);
-        printf(" disk_read(%u, 0x%X, %lu, 1)", pdrv, (UINT)pbuff, lba);
-        dr = disk_read(pdrv, pbuff, lba, 1);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 8;
-        }
-        for (n = 0, pn(pns); n < sz_sect && pbuff[n] == (BYTE)pn(0); n++) ;
-        if (n == sz_sect) {
-            printf(" Data matched.\n");
-        } else {
-            printf("Failed: Read data differs from the data written.\n");
-            return 10;
-        }
-        pns++;
-
-        /* Multiple sector write test */
-        printf("**** Multiple sector write test ****\n");
-        lba = 1; ns = sz_buff / sz_sect;
-        if (ns > 4) ns = 4;
-        for (n = 0, pn(pns); n < (UINT)(sz_sect * ns); n++) pbuff[n] = (BYTE)pn(0);
-        printf(" disk_write(%u, 0x%X, %lu, %u)", pdrv, (UINT)pbuff, lba, ns);
-        dr = disk_write(pdrv, pbuff, lba, ns);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 11;
-        }
-        printf(" disk_ioctl(%u, CTRL_SYNC, NULL)", pdrv);
-        dr = disk_ioctl(pdrv, CTRL_SYNC, 0);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 12;
-        }
-        memset(pbuff, 0, sz_sect * ns);
-        printf(" disk_read(%u, 0x%X, %lu, %u)", pdrv, (UINT)pbuff, lba, ns);
-        dr = disk_read(pdrv, pbuff, lba, ns);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 13;
-        }
-        for (n = 0, pn(pns); n < (UINT)(sz_sect * ns) && pbuff[n] == (BYTE)pn(0); n++) ;
-        if (n == (UINT)(sz_sect * ns)) {
-            printf(" Data matched.\n");
-        } else {
-            printf("Failed: Read data differs from the data written.\n");
-            return 14;
-        }
-        pns++;
-
-        /* Single sector write test (misaligned memory address) */
-        printf("**** Single sector write test (misaligned address) ****\n");
-        lba = 5;
-        for (n = 0, pn(pns); n < sz_sect; n++) pbuff[n+3] = (BYTE)pn(0);
-        printf(" disk_write(%u, 0x%X, %lu, 1)", pdrv, (UINT)(pbuff+3), lba);
-        dr = disk_write(pdrv, pbuff+3, lba, 1);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 15;
-        }
-        printf(" disk_ioctl(%u, CTRL_SYNC, NULL)", pdrv);
-        dr = disk_ioctl(pdrv, CTRL_SYNC, 0);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 16;
-        }
-        memset(pbuff+5, 0, sz_sect);
-        printf(" disk_read(%u, 0x%X, %lu, 1)", pdrv, (UINT)(pbuff+5), lba);
-        dr = disk_read(pdrv, pbuff+5, lba, 1);
-        if (dr == RES_OK) {
-            printf(" - ok.\n");
-        } else {
-            printf(" - failed.\n");
-            return 17;
-        }
-        for (n = 0, pn(pns); n < sz_sect && pbuff[n+5] == (BYTE)pn(0); n++) ;
-        if (n == sz_sect) {
-            printf(" Data matched.\n");
-        } else {
-            printf("Failed: Read data differs from the data written.\n");
-            return 18;
-        }
-        pns++;
-
-        /* 4GB barrier test */
-        printf("**** 4GB barrier test ****\n");
-        if (sz_drv >= 128 + 0x80000000 / (sz_sect / 2)) {
-            lba = 6; lba2 = lba + 0x80000000 / (sz_sect / 2);
-            for (n = 0, pn(pns); n < (UINT)(sz_sect * 2); n++) pbuff[n] = (BYTE)pn(0);
-            printf(" disk_write(%u, 0x%X, %lu, 1)", pdrv, (UINT)pbuff, lba);
-            dr = disk_write(pdrv, pbuff, lba, 1);
-            if (dr == RES_OK) {
-                printf(" - ok.\n");
-            } else {
-                printf(" - failed.\n");
-                return 19;
-            }
-            printf(" disk_write(%u, 0x%X, %lu, 1)", pdrv, (UINT)(pbuff+sz_sect), lba2);
-            dr = disk_write(pdrv, pbuff+sz_sect, lba2, 1);
-            if (dr == RES_OK) {
-                printf(" - ok.\n");
-            } else {
-                printf(" - failed.\n");
-                return 20;
-            }
-            printf(" disk_ioctl(%u, CTRL_SYNC, NULL)", pdrv);
-            dr = disk_ioctl(pdrv, CTRL_SYNC, 0);
-            if (dr == RES_OK) {
-            printf(" - ok.\n");
-            } else {
-                printf(" - failed.\n");
-                return 21;
-            }
-            memset(pbuff, 0, sz_sect * 2);
-            printf(" disk_read(%u, 0x%X, %lu, 1)", pdrv, (UINT)pbuff, lba);
-            dr = disk_read(pdrv, pbuff, lba, 1);
-            if (dr == RES_OK) {
-                printf(" - ok.\n");
-            } else {
-                printf(" - failed.\n");
-                return 22;
-            }
-            printf(" disk_read(%u, 0x%X, %lu, 1)", pdrv, (UINT)(pbuff+sz_sect), lba2);
-            dr = disk_read(pdrv, pbuff+sz_sect, lba2, 1);
-            if (dr == RES_OK) {
-                printf(" - ok.\n");
-            } else {
-                printf(" - failed.\n");
-                return 23;
-            }
-            for (n = 0, pn(pns); pbuff[n] == (BYTE)pn(0) && n < (UINT)(sz_sect * 2); n++) ;
-            if (n == (UINT)(sz_sect * 2)) {
-                printf(" Data matched.\n");
-            } else {
-                printf("Failed: Read data differs from the data written.\n");
-                return 24;
-            }
-        } else {
-            printf(" Test skipped.\n");
-        }
-        pns++;
-
-        printf("**** Test cycle %u of %u completed ****\n\n", cc, ncyc);
-    }
-
-    return 0;
-}
-
-//DWORD buff[1024];  /* 4096 byte working buffer */
-
-void read_file(void)
-{
-	if(f_open(&MyFile, "test.txt", FA_OPEN_EXISTING | FA_READ) != FR_OK)
+	if(f_open(&MyFile, path, FA_OPEN_EXISTING | FA_READ) != FR_OK)
 	{
 		printf("failed to open file\n");
+		return;
 	}
-	else
+	printf("File opened\n");
+	
+	uint32_t bytesread;
+	FRESULT res;
+	
+	//read header (44 bytes)
+	res = f_read(&MyFile, header, sizeof(header), (UINT*)&bytesread);
+	
+	if((bytesread < sizeof(header)) || (res != FR_OK))
 	{
-		printf("File opened\n");
-		
-		uint32_t bytesread;
-		uint8_t rtext[100];
-		
-		FRESULT res = f_read(&MyFile, rtext, sizeof(rtext), (UINT*)&bytesread);
-		if((bytesread == 0) || (res != FR_OK))
-		{
-			printf("Failed to read file\n");
-		}
-		else
-		{
-			printf("Read: %s\n", rtext);
-			if(f_close(&MyFile) != FR_OK)
-			{
-				printf("failed to close file\n");
-			}
-			else
-			{
-				printf("file closed\n");
-			}
-		}
+		printf("Failed to read file\n");
+		return;
 	}
-}
 
-#define BUFFER_SIZE 512
-uint8_t buffer[BUFFER_SIZE];
-uint8_t header[44];
-
-void playback(void)
-{
-	if(f_open(&MyFile, "test.wav", FA_OPEN_EXISTING | FA_READ) != FR_OK)
+	uint16_t channels = header[22] + (header[23]<<8);
+	uint32_t sample_rate = header[24] + (header[25]<<8) + (header[26]<<16) + (header[27]<<24);
+	uint16_t bits_per_sample = header[34] + (header[35]<<8);
+	
+	printf("channels: %d\n", channels);
+	printf("sample rate: %d\n", sample_rate);
+	printf("bits per sample: %d\n", bits_per_sample);
+	
+	if(channels != 1 || sample_rate != 32000 || bits_per_sample != 16)
 	{
-		printf("failed to open file\n");
+		printf("Type of wav encoding is not supported in current version.\n");
+		return;
 	}
-	else
+	
+	uint32_t count = 0;
+	
+	//fill up pwm buffer before we start
+	
+	//lower half
+	res = f_read(&MyFile, fatfs_buffer, FATFS_BUFFER_SIZE, (UINT*)&bytesread);
+	if(res != FR_OK)
 	{
-		printf("File opened\n");
-		
-		uint32_t bytesread;
-		FRESULT res;
-		
-		//read header (44 bytes)
-		res = f_read(&MyFile, header, 44, (UINT*)&bytesread);
-		
-		if((bytesread < 44) || (res != FR_OK))
+		printf("Read failed, count: %d\n", count);
+		end_of_file = true;
+	}
+	
+	count++;
+	pwm_dma_fill_buffer(fatfs_buffer, bytesread, true);
+	
+	//upper half
+	res = f_read(&MyFile, fatfs_buffer, FATFS_BUFFER_SIZE, (UINT*)&bytesread);
+	if(res != FR_OK)
+	{
+		printf("Read failed, count: %d\n", count);
+		end_of_file = true;
+	}
+	
+	count++;
+	pwm_dma_fill_buffer(fatfs_buffer, bytesread, false);
+	
+	//start PWM, CH1 and CH1N
+	HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1, (uint32_t *)pwm_dma_buffer, FATFS_BUFFER_SIZE);
+	HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+	
+	pwm_dma_ready = false;
+	
+	//loop until the end of file
+	while(end_of_file == false)
+	{
+		if(pwm_dma_ready)
 		{
-			printf("Failed to read file\n");
-		}
-		else
-		{
-			uint16_t channels = header[22] + (header[23]<<8);
-			uint32_t sample_rate = header[24] + (header[25]<<8) + (header[26]<<16) + (header[27]<<24);
-			uint16_t bits_per_sample = header[34] + (header[35]<<8);
-			
-			printf("channels: %d\n", channels);
-			printf("sample rate: %d\n", sample_rate);
-			printf("bits per sample: %d\n", bits_per_sample);
-			
-			uint32_t count = 0;
-			int32_t pcm_value;
-			
-			//fill up pwm buffer before we start
-			
-			//lower half
-			res = f_read(&MyFile, buffer, BUFFER_SIZE, (UINT*)&bytesread);
+			res = f_read(&MyFile, fatfs_buffer, FATFS_BUFFER_SIZE, (UINT*)&bytesread);
 			if(res != FR_OK)
 			{
 				printf("Read failed, count: %d\n", count);
+				HAL_TIM_PWM_Stop_DMA(&htim1, TIM_CHANNEL_1);
+				HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
+				return;
+			}
+			
+			if(f_eof(&MyFile))
+			{
+				printf("end of file\n");
 				end_of_file = true;
 			}
 			
-			if(bytesread != BUFFER_SIZE)
-			{
-				printf("read less bytes than buffersize: %d\n", bytesread);
-			}
-			
-			count++;
-			for(uint16_t i = 0; i < bytesread; i+=2)
-			{
-				pcm_value = (int32_t)(buffer[i] + (buffer[i+1]<<8));
-				pwm_dma_buffer[i/2] = ((uint16_t)(pcm_value + 32768))>>5;
-			}
-			
-			//upper half
-			res = f_read(&MyFile, buffer, BUFFER_SIZE, (UINT*)&bytesread);
-			if(res != FR_OK)
-			{
-				printf("Read failed, count: %d\n", count);
-				end_of_file = true;
-			}
-			
-			if(bytesread != BUFFER_SIZE)
-			{
-				printf("read less bytes than buffersize: %d\n", bytesread);
-			}
-			
-			count++;
-			for(uint16_t i = 0; i < bytesread; i+=2)
-			{
-				pcm_value = (int32_t)(buffer[i] + (buffer[i+1]<<8));
-				pwm_dma_buffer[i/2 + BUFFER_SIZE/2] = ((uint16_t)(pcm_value + 32768))>>5;
-			}
-			
-			//start PWM
-			HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1, (uint32_t *)pwm_dma_buffer, BUFFER_SIZE);
-
-			HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+			pwm_dma_fill_buffer(fatfs_buffer, bytesread, pwm_dma_lower_half);
 			
 			pwm_dma_ready = false;
-			
-			//loop until the end of file
-			while(end_of_file == false)
-			{
-				if(pwm_dma_ready)
-				{
-					res = f_read(&MyFile, buffer, BUFFER_SIZE, (UINT*)&bytesread);
-					if(res != FR_OK)
-					{
-						printf("Read failed, count: %d\n", count);
-						break;
-					}
-					
-					if(bytesread != BUFFER_SIZE)
-					{
-						printf("read less bytes than buffersize: %d\n", bytesread);
-					}
-					
-					if(f_eof(&MyFile))
-					{
-						printf("end of file\n");
-						end_of_file = true;
-					}
-					
-					for(uint16_t i = 0; i < bytesread; i+=2)
-					{
-						if(pwm_dma_lower_half)
-						{
-							pcm_value = (int32_t)(buffer[i] + (buffer[i+1]<<8));
-							pwm_dma_buffer[i/2] = ((uint16_t)(pcm_value + 32768))>>5;
-						}
-						else
-						{
-							pcm_value = (int32_t)(buffer[i] + (buffer[i+1]<<8));
-							pwm_dma_buffer[i/2 + BUFFER_SIZE/2] = ((uint16_t)(pcm_value + 32768))>>5;
-						}
-					}
-					
-					pwm_dma_ready = false;
-					count++;
-				}
-			}
+			count++;
 		}
 	}
 	printf("playback done\n");
@@ -713,40 +371,11 @@ int main(void)
 	else
 	{
 		printf("disk mounted\n");
-		//read_file();
-		playback();
+		playback("test.wav");
 	}
-
-	
-	/*
-	int rc;
-
-	// Check function/compatibility of the physical drive #0
-	rc = test_diskio(0, 3, buff, sizeof buff);
-	if (rc) {
-			printf("Sorry the function/compatibility test failed. (rc=%d)\nFatFs will not work on this disk driver.\n", rc);
-	} else {
-			printf("Congratulations! The disk driver works well.\n");
-	}
-	*/
 	
 	//play_tone((tone_t){880, 1000, 64});
 	//play_tone((tone_t){1000, 1000, 64});
-	
-	/*
-	pwm_dma_buffer[0] = PWM_PERIOD + PWM_PERIOD/2;
-	pwm_dma_buffer[1] = PWM_PERIOD - PWM_PERIOD/2;
-
-	
-	HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1, (uint32_t *)pwm_dma_buffer, 2);
-
-	HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-	
-	HAL_Delay(1000);
-	
-	HAL_TIM_PWM_Stop_DMA(&htim1, TIM_CHANNEL_1);
-	HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
-	*/
 	
   /* USER CODE END 2 */
 
